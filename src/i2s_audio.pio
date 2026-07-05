@@ -1,0 +1,71 @@
+.program i2s_capture
+
+; Standard I2S (MSB) 16-bit Capture (1-clock delay)
+; Retro-Go ESP32 output format (I2S_COMM_FORMAT_STAND_I2S)
+; Pin 0: DATA (GPIO 4)
+; Pin 1: BCK  (GPIO 5)
+; Pin 2: WS   (GPIO 6)
+
+    ; Sync to WS falling edge (Left channel boundary)
+    wait 1 pin 2
+    wait 0 pin 2
+
+.wrap_target
+    ; === LEFT CHANNEL (WS LOW) ===
+    set x, 15
+left_loop:
+    wait 0 pin 1
+    wait 1 pin 1
+    in pins, 1
+    jmp x-- left_loop
+    
+    ; === RIGHT CHANNEL (WS HIGH) ===
+    wait 0 pin 2
+    wait 1 pin 2
+    
+    set x, 15
+right_loop:
+    wait 0 pin 1
+    wait 1 pin 1
+    in pins, 1
+    jmp x-- right_loop
+    
+    ; Push both channels as one 32-bit word
+    ; Left is in upper 16 bits, Right is in lower 16 bits.
+    push noblock
+    
+    ; Wait for WS falling edge to align with next frame start
+    wait 1 pin 2
+    wait 0 pin 2
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+
+static inline void i2s_capture_program_init(PIO pio, uint sm, uint offset, uint pin_dat, uint pin_ws, uint pin_bck) {
+    pio_sm_config c = i2s_capture_program_get_default_config(offset);
+
+    // IN pin base = DAT
+    sm_config_set_in_pins(&c, pin_dat);
+    // OUT pin set = DAT, BCK, WS (must be consecutive! 4, 5, 6)
+    sm_config_set_out_pins(&c, pin_dat, 3);
+
+    // Shift LEFT (MSB first), no autopush.
+    // Left channel shifts in first, pushed to bits 31:16.
+    // Right channel shifts in second, pushed to bits 15:0.
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    // Join FIFOs for 8-word RX depth
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_gpio_init(pio, pin_dat);
+    pio_gpio_init(pio, pin_bck);
+    pio_gpio_init(pio, pin_ws);
+
+    pio_sm_set_pindirs_with_mask64(pio, sm, 0,
+        (1ull << pin_dat) | (1ull << pin_bck) | (1ull << pin_ws));
+
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

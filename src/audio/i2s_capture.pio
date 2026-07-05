@@ -1,0 +1,88 @@
+.program i2s_capture
+
+; =============================================================================
+; Retro-Go ESP32 I2S Capture (Standard I2S 16-bit, 32fs frames)
+; =============================================================================
+; Pin Mapping for SPItoHDMI PCB:
+; OUT_BASE = DAT (GPIO 4)
+; pin 0 = DAT (GPIO 4)
+; pin 1 = BCK (GPIO 5)
+; pin 2 = WS  (GPIO 6)
+;
+; Standard I2S: 
+; - 1-clock delay after WS transition before MSB
+; - WS LOW = Left Channel
+; - WS HIGH = Right Channel
+
+    ; Sync: wait for BCK activity (bus alive)
+    wait 0 pin 1
+    wait 1 pin 1
+
+    ; Sync to WS falling edge (Left channel boundary)
+    wait 1 pin 2
+    wait 0 pin 2
+
+.wrap_target
+    ; === LEFT CHANNEL (WS LOW) ===
+    ; Skip 1 BCK cycle (standard I2S 1-bit delay)
+    wait 0 pin 1
+    wait 1 pin 1
+
+    ; Capture exactly 16 bits
+    set x, 15
+left_loop:
+    wait 0 pin 1
+    wait 1 pin 1
+    nop                             ; Hold margin before sampling
+    in pins, 1
+    jmp x-- left_loop
+    push noblock
+
+    ; === RIGHT CHANNEL (WS HIGH) ===
+    wait 1 pin 2                    ; Wait for WS transition
+    ; Skip 1 BCK cycle (standard I2S 1-bit delay)
+    wait 0 pin 1
+    wait 1 pin 1
+
+    ; Capture exactly 16 bits
+    set x, 15
+right_loop:
+    wait 0 pin 1
+    wait 1 pin 1
+    nop
+    in pins, 1
+    jmp x-- right_loop
+    push noblock
+
+    wait 0 pin 2                    ; Wait for WS low (next frame)
+.wrap
+
+% c-sdk {
+#include "hardware/gpio.h"
+
+static inline void i2s_capture_program_init(PIO pio, uint sm, uint offset, uint pin_dat, uint pin_ws, uint pin_bck) {
+    pio_sm_config c = i2s_capture_program_get_default_config(offset);
+
+    // IN pin base = DAT
+    sm_config_set_in_pins(&c, pin_dat);
+    // OUT pin set = DAT, BCK, WS (must be consecutive! 4, 5, 6)
+    sm_config_set_out_pins(&c, pin_dat, 3);
+
+    // Shift LEFT (MSB first), no autopush.
+    // 16 bits captured into bits 15:0 of ISR.
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    // Join FIFOs for 8-word RX depth
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_gpio_init(pio, pin_dat);
+    pio_gpio_init(pio, pin_bck);
+    pio_gpio_init(pio, pin_ws);
+
+    pio_sm_set_pindirs_with_mask64(pio, sm, 0,
+        (1ull << pin_dat) | (1ull << pin_bck) | (1ull << pin_ws));
+
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

@@ -1,0 +1,17 @@
+.program spi_st7789
+
+; 9-Bit Protocol Lock
+; Pin 0: MOSI, Pin 1: DC, Pin 2: SCLK
+
+.wrap_target
+    wait 1 pin 2        ; Wait for SCLK High (Bit 7 of byte)
+    in pins, 2          ; Sample [DC, MOSI_Bit7]. DC is bit 1, MOSI is bit 0
+    wait 0 pin 2        ; Wait for SCLK Low
+    
+    set x, 6            ; 7 more bits to go
+bit_loop:
+    wait 1 pin 2        ; SCLK High (Bits 6-0)
+    in pins, 1          ; Sample MOSI (Pin 0)
+    wait 0 pin 2        ; SCLK Low
+    jmp x-- bit_loop
+.wrap
