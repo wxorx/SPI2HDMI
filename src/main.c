@@ -26,6 +26,9 @@
 #define BRIGHTNESS_OFFSET            2       // Flat offset: lifts absolute black level (0-31 scale)
 #define COLOR_SATURATION             256     // Saturation: 256 = default (1.0), < 256 = muted, > 256 = boosted
 
+// Core Voltage Regulator Configuration (Default: VREG_VOLTAGE_1_20 for 1.20V max stability)
+#define VREG_VOLTAGE_LEVEL           VREG_VOLTAGE_1_20
+
 #if ENABLE_BRIGHTNESS_CORRECTION || (defined(COLOR_SATURATION) && (COLOR_SATURATION != 256))
 static uint16_t correction_lut[65536];
 #endif
@@ -493,7 +496,7 @@ void core1_main() {
 static uint32_t spi_raw_buf[SPI_BUF_SIZE] __attribute__((aligned(16384)));
 
 int main() {
-    vreg_set_voltage(VREG_VOLTAGE_1_20);
+    vreg_set_voltage(VREG_VOLTAGE_LEVEL);
     set_sys_clock_khz(252000, true);
     clock_configure_int_divider(clk_hstx, 0, CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLK_SYS, 252000000, 2);
     

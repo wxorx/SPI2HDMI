@@ -78,6 +78,23 @@ The Pico 2 (RP2350) pins are configured as follows:
 
 ---
 
+## Hardware Compatibility & Acoustic Noise Note
+
+Due to high-speed differential TMDS signal generation (252 MHz HSTX pin switching on GPIO 12–19), some third-party RP2350 development boards may exhibit physical **acoustic coil whine / capacitor hum**. This is a mechanical hardware characteristic caused by lower-grade decoupling capacitors (piezoelectric effect) under rapid $dI/dt$ power rail switching.
+
+### Tested Board Results:
+* **Original Raspberry Pi Pico 2**: **Quiet / No Issue**
+* **WeActStudio RP2350 (V10)**: **Quiet / No Issue**
+* **WeActStudio RP2350 (V20)**: **Quiet / No Issue**
+* **Waveshare RP2350-Plus**: **Quiet / No Issue**
+* **Generic Red RP2350 (AliExpress)**: **Exhibits Coil Whine** (Physical capacitor vibration under HSTX pin switching)
+
+If you experience acoustic whine, it is purely mechanical component vibration on that specific board design and does not affect functionality or longevity. For a silent hardware setup, we recommend using an **Original Raspberry Pi Pico 2** or one of the above boards.
+
+> **Hardware Mitigation Tip:** If using a board with acoustic whine, applying a small dab of non-conductive **hot glue** directly over the crystal oscillator package and its surrounding load capacitors acts as a mechanical potting/damping compound, significantly muffling or silencing the acoustic vibrations.
+
+---
+
 ## Developer Integration Guide
 
 ### 1. Adapting to Non-Retro-Go Projects
@@ -102,13 +119,15 @@ The audio capture module expects **Standard I2S** (MSB-first, 16-bit stereo, 32f
 Several macros at the top of src/main.c allow you to configure behavior:
 
 * **`ASPECTBUTTON`:** Change this to redirect the aspect ratio button toggle pin:
+* **Core Voltage Regulation:** You can adjust the internal core voltage regulator setting to reduce power consumption or acoustic coil whine on certain third-party RP2350 boards:
   ```c
-  #define ASPECTBUTTON 22
+  #define VREG_VOLTAGE_LEVEL VREG_VOLTAGE_1_20 // Default: 1.20V 
   ```
+  Options include `VREG_VOLTAGE_1_10` (1.10V), `VREG_VOLTAGE_1_15` (1.15V), or `VREG_VOLTAGE_1_20` (1.20V).
 * **Image Correction:** You can adjust overall image brightness, shadow boost, and color saturation (vibrancy):
   ```c
   #define ENABLE_BRIGHTNESS_CORRECTION 1
-  #define BRIGHTNESS_GAMMA             0.90f   // Lower = more detail in dark areas
+  #define BRIGHTNESS_GAMMA             1.0f   // Lower = more detail in dark areas
   #define BRIGHTNESS_GAIN              1.0f    // Scales overall brightness
   #define BRIGHTNESS_OFFSET            2       // Flat offset added to black levels
   #define COLOR_SATURATION             256     // 256 = default, < 256 = muted, > 256 = boosted
