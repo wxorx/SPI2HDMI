@@ -93,6 +93,9 @@ If you experience acoustic whine, it is purely mechanical component vibration on
 
 > **Hardware Mitigation Tip:** If using a board with acoustic whine, applying a small dab of non-conductive **hot glue** directly over the crystal oscillator package and its surrounding load capacitors acts as a mechanical potting/damping compound, significantly muffling or silencing the acoustic vibrations.
 
+<img width="857" height="528" alt="image" src="https://github.com/user-attachments/assets/2358cc54-48c7-4929-8ac7-530920e1b0aa" />
+
+
 ---
 
 ## Developer Integration Guide
