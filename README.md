@@ -127,6 +127,11 @@ Several macros at the top of src/main.c allow you to configure behavior:
   #define VREG_VOLTAGE_LEVEL VREG_VOLTAGE_1_20 // Default: 1.20V 
   ```
   Options include `VREG_VOLTAGE_1_10` (1.10V), `VREG_VOLTAGE_1_15` (1.15V), or `VREG_VOLTAGE_1_20` (1.20V).
+  * **Audio Volume Gain:** You can adjust the output volume scaling percentage:
+  ```c
+  #define AUDIO_VOLUME_PERCENT         100     // 100 = 100% (default), 120 = 120% (+20% boost)
+  ```
+  Values above 100 boost the volume (e.g. `120` for +20% boost, `150` for +50% boost). Built-in overflow clamping prevents digital clipping distortion. When set to `100`, the volume calculation compiles out completely for zero overhead.
 * **Image Correction:** You can adjust overall image brightness, shadow boost, and color saturation (vibrancy):
   ```c
   #define ENABLE_BRIGHTNESS_CORRECTION 1

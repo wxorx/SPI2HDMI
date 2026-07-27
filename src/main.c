@@ -29,6 +29,9 @@
 // Core Voltage Regulator Configuration (Default: VREG_VOLTAGE_1_20 for 1.20V max stability)
 #define VREG_VOLTAGE_LEVEL           VREG_VOLTAGE_1_20
 
+// Audio Volume Gain Configuration (Percentage: 100 = 100%/default boosted baseline, > 100 = additional boost)
+#define AUDIO_VOLUME_PERCENT         100
+
 #if ENABLE_BRIGHTNESS_CORRECTION || (defined(COLOR_SATURATION) && (COLOR_SATURATION != 256))
 static uint16_t correction_lut[65536];
 #endif
@@ -404,11 +407,10 @@ void audio_task() {
         i2s_sample_counter++;
         
         audio_sample_t s;
-        // Correct Channel Alignment: Top 16 is Left, Bottom 16 is Right.
-        // Shift left by 1 to discard the 1-clock delay bit and restore the sign bit.
-        // Full volume scaling (no division by 4) now that sign-bit corruption is fixed.
-        int32_t raw_l = (int16_t)((val >> 16) << 1);
-        int32_t raw_r = (int16_t)((val & 0xFFFF) << 1);
+        // Correct Channel Alignment & Native 2x Boost:
+        // Shift left by 2 to discard 1-clock delay bit, restore sign bit, and apply native 2x volume boost to standard HDMI line levels.
+        int32_t raw_l = (int16_t)((val >> 16) << 2);
+        int32_t raw_r = (int16_t)((val & 0xFFFF) << 2);
 
         // --- High-Precision Q16 DC Blocker (64-bit Overflow-Free) ---
         int64_t x_diff_l = (int64_t)raw_l - dc_prev_in_l;
@@ -461,6 +463,15 @@ void audio_task() {
                 lpf_y4_r += ((lpf_y3_r - lpf_y4_r) * (int64_t)lpf_alpha) >> 16;
                 out_r = (int32_t)(lpf_y4_r >> 16);
             }
+
+#if defined(AUDIO_VOLUME_PERCENT) && (AUDIO_VOLUME_PERCENT != 100)
+            out_l = (out_l * AUDIO_VOLUME_PERCENT) / 100;
+            out_r = (out_r * AUDIO_VOLUME_PERCENT) / 100;
+            if (out_l > 32767) out_l = 32767;
+            else if (out_l < -32768) out_l = -32768;
+            if (out_r > 32767) out_r = 32767;
+            else if (out_r < -32768) out_r = -32768;
+#endif
 
             packet_samples[packet_idx].left  = (int16_t)out_l;
             packet_samples[packet_idx].right = (int16_t)out_r;
