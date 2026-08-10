@@ -1,5 +1,6 @@
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -12,16 +13,17 @@
 #include "hardware/structs/bus_ctrl.h"
 
 #include "pico_hdmi/video_output.h"
-#include "pico_hdmi/video_output_rt.h"
 #include "pico_hdmi/hstx_data_island_queue.h"
 #include "pico_hdmi/hstx_packet.h"
+
+#include "audio_profiles.h"
 
 #include "spi_capture.pio.h"
 #include "i2s_audio.pio.h"
 
 // Brightness & Gamma Correction Configuration
 #define ENABLE_BRIGHTNESS_CORRECTION 1
-#define BRIGHTNESS_GAMMA             1.0f   // Exponent: < 1.0 brightens shadows, > 1.0 darkens
+#define BRIGHTNESS_GAMMA             0.9f   // Exponent: < 1.0 brightens shadows, > 1.0 darkens
 #define BRIGHTNESS_GAIN              1.0f    // Multiplier: scales overall brightness
 #define BRIGHTNESS_OFFSET            2       // Flat offset: lifts absolute black level (0-31 scale)
 #define COLOR_SATURATION             256     // Saturation: 256 = default (1.0), < 256 = muted, > 256 = boosted
@@ -32,8 +34,13 @@
 // Audio Volume Gain Configuration (Percentage: 100 = 100%/default boosted baseline, > 100 = additional boost)
 #define AUDIO_VOLUME_PERCENT         100
 
-#if ENABLE_BRIGHTNESS_CORRECTION || (defined(COLOR_SATURATION) && (COLOR_SATURATION != 256))
+#if defined(COLOR_SATURATION) && (COLOR_SATURATION != 256)
 static uint16_t correction_lut[65536];
+#elif ENABLE_BRIGHTNESS_CORRECTION
+// Brightness/gamma correction is separable by channel. Combining red and
+// green keeps the hot pixel path to two lookups while avoiding a 128 KiB LUT.
+static uint16_t correction_rg_lut[2048];
+static uint16_t correction_b_lut[32];
 #endif
 
 #define FB_WIDTH  320
@@ -42,22 +49,28 @@ static uint16_t correction_lut[65536];
 
 // Aspect Ratio Toggle Button GPIO pin
 #define ASPECTBUTTON 22
+#define ASPECT_DEBOUNCE_US 30000u
 
-// Diagnostics Configuration (Disabled by default)
-// Set to 1 to enable diagnostic logging to USB serial COM port.
-// Note: If enabled, you must also set pico_enable_stdio_usb(spi_to_hdmi 1) in CMakeLists.txt
-#define ENABLE_DIAGNOSTICS           0
+// CMake's SPI_TO_HDMI_DIAGNOSTICS option controls both this code and USB stdio.
+#ifndef ENABLE_DIAGNOSTICS
+#define ENABLE_DIAGNOSTICS 0
+#endif
 
 #if ENABLE_DIAGNOSTICS
 static volatile uint32_t diag_bytes_received = 0;
 static volatile uint32_t diag_frame_count = 0;
-static uint64_t diag_last_time = 0;
 static uint64_t diag_active_transfer_time = 0; // Cumulative microseconds spent in active transfer
 static uint32_t diag_active_bytes = 0;          // Cumulative bytes received during active transfer
 static uint64_t burst_start_time = 0;
 static uint64_t burst_last_data_time = 0;
 static uint32_t burst_bytes = 0;
 static bool in_burst = false;
+static uint32_t diag_max_dma_backlog = 0;
+static uint32_t diag_invalid_windows = 0;
+static uint32_t diag_window_changes = 0;
+static volatile uint32_t diag_audio_frames = 0;
+static volatile uint32_t diag_audio_queue_throttles = 0;
+static volatile uint32_t diag_raw_audio_rate = 0;
 #endif
 
 static uint16_t framebuffer[FB_SIZE] __attribute__((aligned(64)));
@@ -71,21 +84,7 @@ static int pixel_byte_idx = 0;
 static uint16_t temp_pixel = 0;
 static volatile bool is_4_3 = true;
 
-// SPI Fast Decoding Table
-static uint8_t mosi_table[65536];
-static bool is_cmd_table[65536];
-
-void init_tables() {
-    for (int i = 0; i < 65536; i++) {
-        uint8_t m = 0;
-        if (i & 0x0001) m |= 0x01; if (i & 0x0004) m |= 0x02;
-        if (i & 0x0010) m |= 0x04; if (i & 0x0040) m |= 0x08;
-        if (i & 0x0100) m |= 0x10; if (i & 0x0400) m |= 0x20;
-        if (i & 0x1000) m |= 0x40; if (i & 0x4000) m |= 0x80;
-        mosi_table[i] = m;
-        is_cmd_table[i] = !(i & 0x0002);
-    }
-
+static void init_correction_tables(void) {
 #if ENABLE_BRIGHTNESS_CORRECTION
     // Initialize temporary Red, Green, Blue LUTs for brightness mapping
     uint8_t temp_lut_r[32];
@@ -121,7 +120,7 @@ void init_tables() {
     }
 #endif
 
-#if ENABLE_BRIGHTNESS_CORRECTION || (defined(COLOR_SATURATION) && (COLOR_SATURATION != 256))
+#if defined(COLOR_SATURATION) && (COLOR_SATURATION != 256)
     // Populate the 16-bit combined Correction Lookup Table
     for (int i = 0; i < 65536; i++) {
         uint16_t r = (i >> 11) & 0x1F;
@@ -162,6 +161,17 @@ void init_tables() {
 #endif
 
         correction_lut[i] = (r << 11) | (g << 5) | b;
+    }
+#elif ENABLE_BRIGHTNESS_CORRECTION
+    // With default saturation, channel correction is independent. The upper
+    // 11 input bits contain red and green; blue occupies the lower 5 bits.
+    for (int i = 0; i < 2048; i++) {
+        uint16_t r = (i >> 6) & 0x1F;
+        uint16_t g = i & 0x3F;
+        correction_rg_lut[i] = (uint16_t)((temp_lut_r[r] << 11) | (temp_lut_g[g] << 5));
+    }
+    for (int i = 0; i < 32; i++) {
+        correction_b_lut[i] = temp_lut_b[i];
     }
 #endif
 }
@@ -236,8 +246,10 @@ static inline void __scratch_x("") process_spi_byte(uint8_t data, bool is_cmd) {
         if (pixel_byte_idx == 0) { temp_pixel = (data << 8); pixel_byte_idx = 1; }
         else {
             temp_pixel |= data; pixel_byte_idx = 0;
-#if ENABLE_BRIGHTNESS_CORRECTION || (defined(COLOR_SATURATION) && (COLOR_SATURATION != 256))
+#if defined(COLOR_SATURATION) && (COLOR_SATURATION != 256)
             temp_pixel = correction_lut[temp_pixel];
+#elif ENABLE_BRIGHTNESS_CORRECTION
+            temp_pixel = correction_rg_lut[temp_pixel >> 5] | correction_b_lut[temp_pixel & 0x1F];
 #endif
             if (cur_x <= end_x && cur_y <= end_y && cur_x < FB_WIDTH && cur_y < FB_HEIGHT)
                 framebuffer[cur_y * FB_WIDTH + cur_x] = temp_pixel;
@@ -254,19 +266,38 @@ static inline void __scratch_x("") process_spi_byte(uint8_t data, bool is_cmd) {
         else if (pixel_byte_idx == 1) start_x |= data;
         else if (pixel_byte_idx == 2) end_x = (data << 8);
         else if (pixel_byte_idx == 3) end_x |= data;
-        pixel_byte_idx++; 
+        pixel_byte_idx++;
+#if ENABLE_DIAGNOSTICS
+        if (pixel_byte_idx == 4 && (start_x > end_x || end_x >= FB_WIDTH)) {
+            diag_invalid_windows++;
+        }
+#endif
     } else if (last_cmd == 0x2B) {
         if (pixel_byte_idx == 0) start_y = (data << 8);
         else if (pixel_byte_idx == 1) start_y |= data;
         else if (pixel_byte_idx == 2) end_y = (data << 8);
         else if (pixel_byte_idx == 3) end_y |= data;
         pixel_byte_idx++; 
+#if ENABLE_DIAGNOSTICS
+        if (pixel_byte_idx == 4) {
+            diag_window_changes++;
+            if (start_y > end_y || end_y >= FB_HEIGHT) {
+                diag_invalid_windows++;
+            }
+        }
+#endif
     }
 }
 
 static void __scratch_x("") scanline_callback(uint32_t v_scanline, uint32_t active_line, uint32_t *dst) {
+    (void)v_scanline;
     uint32_t fb_y = active_line >> 1;
-    if (fb_y >= FB_HEIGHT) { memset(dst, 0, 640 * sizeof(uint32_t)); return; }
+    if (fb_y >= FB_HEIGHT) { memset(dst, 0, 640 * sizeof(uint16_t)); return; }
+
+    // Each source row is emitted twice for 240-to-480-line doubling. The line
+    // buffer still contains the even line, so the odd partner needs no work.
+    if (active_line & 1u) return;
+
     const uint16_t *src = &framebuffer[fb_y * FB_WIDTH];
 
     if (is_4_3) {
@@ -319,83 +350,91 @@ static int64_t lpf_y4_r = 0; // Stage 4 state (Q16)
 // Linear Interpolation SRC State
 static audio_sample_t prev_audio_sample = {0, 0};
 static uint32_t phase_accum = 0;
+static uint32_t phase_inc = (uint32_t)(((uint64_t)32000u << 16) / 48000u);
+
+static inline int16_t clamp_i16(int32_t value) {
+    if (value > INT16_MAX) return INT16_MAX;
+    if (value < INT16_MIN) return INT16_MIN;
+    return (int16_t)value;
+}
 
 void audio_task() {
-    // Check Toggle Button
-    static bool last_btn = true;
+    uint32_t now = time_us_32();
+
+    // Debounce the aspect-ratio button and toggle only on a stable press.
+    static bool raw_btn_last = true;
+    static bool stable_btn = true;
+    static uint32_t raw_btn_changed_at = 0;
     bool btn = gpio_get(ASPECTBUTTON);
-    if (!btn && last_btn) is_4_3 = !is_4_3;
-    last_btn = btn;
+    if (btn != raw_btn_last) {
+        raw_btn_last = btn;
+        raw_btn_changed_at = now;
+    } else if (btn != stable_btn && (uint32_t)(now - raw_btn_changed_at) >= ASPECT_DEBOUNCE_US) {
+        stable_btn = btn;
+        if (!stable_btn) is_4_3 = !is_4_3;
+    }
 
     // Fast Rate Measurement using hardware timer (Independent of video framerate!)
-    uint32_t now = time_us_32();
     if (last_time_us == 0) last_time_us = now; // Initialize on first run
     
     if (now - last_time_us >= 250000) { // Update every 250ms
         uint32_t elapsed = now - last_time_us;
-        uint32_t new_rate = (uint32_t)(((uint64_t)(i2s_sample_counter - last_i2s_sample_count) * 1000000ULL) / elapsed);
-        
-        // Snap instantly and reset filters if the rate changed significantly (more than 10%).
-        // Otherwise, filter the rate slowly to eliminate timer measurement noise.
-        uint32_t old_rate = current_i2s_rate;
-        if (old_rate == 0 || abs((int)new_rate - (int)old_rate) > (int)old_rate / 10) {
-            current_i2s_rate = new_rate;
-            // Clear all filter states to prevent transient pops on emulator swap
-            dc_prev_in_l = 0; dc_y_accum_l = 0;
-            dc_prev_in_r = 0; dc_y_accum_r = 0;
-            lpf_y1_l = 0; lpf_y2_l = 0; lpf_y3_l = 0; lpf_y4_l = 0;
-            lpf_y1_r = 0; lpf_y2_r = 0; lpf_y3_r = 0; lpf_y4_r = 0;
-        } else {
-            current_i2s_rate = (current_i2s_rate * 31 + new_rate) / 32;
+        uint32_t samples_since = i2s_sample_counter - last_i2s_sample_count;
+
+        // Keep the last valid rate while I2S is idle. Setting the rate to zero
+        // would both underflow the queue correction and produce a zero SRC step.
+        if (samples_since != 0) {
+            uint32_t new_rate = (uint32_t)(((uint64_t)samples_since * 1000000ULL) / elapsed);
+#if ENABLE_DIAGNOSTICS
+            diag_raw_audio_rate = new_rate;
+#endif
+
+            // Snap instantly and reset filters if the rate changed significantly (more than 10%).
+            // Otherwise, filter the rate slowly to eliminate timer measurement noise.
+            uint32_t old_rate = current_i2s_rate;
+            if (abs((int)new_rate - (int)old_rate) > (int)old_rate / 10) {
+                current_i2s_rate = new_rate;
+                // Clear all filter states to prevent transient pops on emulator swap
+                dc_prev_in_l = 0; dc_y_accum_l = 0;
+                dc_prev_in_r = 0; dc_y_accum_r = 0;
+                lpf_y1_l = 0; lpf_y2_l = 0; lpf_y3_l = 0; lpf_y4_l = 0;
+                lpf_y1_r = 0; lpf_y2_r = 0; lpf_y3_r = 0; lpf_y4_r = 0;
+            } else {
+                current_i2s_rate = (current_i2s_rate * 31 + new_rate) / 32;
+            }
+
+            if (current_i2s_rate < 8000) current_i2s_rate = 8000;
+            if (current_i2s_rate > 192000) current_i2s_rate = 192000;
+
+            // Closed-loop feedback: fine-tune the rate based on HDMI queue level to prevent drift.
+            uint32_t level = hstx_di_queue_get_level();
+            if (level > 140 && current_i2s_rate < 192000) {
+                current_i2s_rate += 1; // Queue too full: increase rate slightly to generate fewer samples
+            } else if (level < 110 && current_i2s_rate > 8000) {
+                current_i2s_rate -= 1; // Queue too empty: decrease rate slightly to generate more samples
+            }
+
+            // The input-rate estimate changes only here, so calculate the SRC
+            // step once per update instead of once per captured audio sample.
+            phase_inc = (uint32_t)(((uint64_t)current_i2s_rate << 16) / 48000u);
         }
-        
-        // Closed-loop feedback: fine-tune the rate based on HDMI queue level to prevent drift
-        uint32_t level = hstx_di_queue_get_level();
-        if (level > 140) {
-            current_i2s_rate += 1; // Queue too full: increase rate slightly to generate fewer samples
-        } else if (level < 110) {
-            current_i2s_rate -= 1; // Queue too empty: decrease rate slightly to generate more samples
-        }
-        
-        if (current_i2s_rate < 8000) current_i2s_rate = 8000;
-        if (current_i2s_rate > 192000) current_i2s_rate = 192000;
         
         last_i2s_sample_count = i2s_sample_counter;
         last_time_us = now;
     }
 
-    // Select LPF coefficients (for 48kHz domain) based on physical sample rate and video dimensions
-    uint32_t lpf_alpha = 65536; // Default to bypass
-    if (current_i2s_rate < 24000) {
-        lpf_alpha = 17563; // Doom (physical ~22kHz, native 11kHz) -> cutoff ~1200Hz (4-stage LPF at 48kHz)
-    } else if (current_i2s_rate < 36000) {
-        // Both Gameboy and Lynx run at physical ~32000 Hz.
-        // We distinguish Gameboy from Lynx using active video dimensions:
-        // - Gameboy: 160x144 (aspect ratio 1.11).
-        // - Lynx: 160x102 (aspect ratio 1.57).
-        uint32_t active_w = end_x - start_x + 1;
-        uint32_t active_h = end_y - start_y + 1;
-        
-        // If active height is 102 or 204, or aspect ratio is wide (Lynx), bypass LPF.
-        // Otherwise (Gameboy 144 or 240, or narrow aspect ratio), apply LPF.
-        if (active_h == 102 || active_h == 204 || (active_w * 10 >= active_h * 13)) {
-            lpf_alpha = 65536; // Lynx -> bypass
-        } else {
-            lpf_alpha = 29261; // Gameboy -> cutoff ~2000Hz (4-stage LPF at 48kHz)
-        }
+    // Button and rate housekeeping must continue while audio is idle, but the
+    // filter selection and sample pipeline have no work until a word arrives.
+    if (pio_sm_is_rx_fifo_empty(pio_aud, sm_aud)) {
+        return;
     }
 
-    // Print diagnostics every 2 seconds over USB serial
-    /*
-    static uint32_t last_print_time = 0;
-    if (now - last_print_time >= 2000000) {
-        last_print_time = now;
-        uint32_t active_w = end_x - start_x + 1;
-        uint32_t active_h = end_y - start_y + 1;
-        printf("[AUDIO] Phys Rate: %lu Hz, LPF Alpha: %lu, Win: %lux%lu\n", 
-               current_i2s_rate, lpf_alpha, active_w, active_h);
-    }
-    */
+    uint32_t active_w = end_x - start_x + 1;
+    uint32_t active_h = end_y - start_y + 1;
+
+    audio_profile_t audio_profile =
+        audio_profile_select(current_i2s_rate, active_w, active_h);
+    uint32_t lpf_alpha = audio_filter_alpha(audio_profile.filter);
 
     // Drain the FIFO (max 8 words) to keep latency minimal without starving video
     int processed = 0;
@@ -405,12 +444,16 @@ void audio_task() {
         // PIO pushes a single 32-bit word: Left in top 16, Right in bottom 16
         uint32_t val = pio_sm_get(pio_aud, sm_aud);
         i2s_sample_counter++;
-        
+#if ENABLE_DIAGNOSTICS
+        diag_audio_frames++;
+#endif
+
+        uint16_t captured_l = (uint16_t)(val >> 16);
+        uint16_t captured_r = (uint16_t)val;
+
         audio_sample_t s;
-        // Correct Channel Alignment & Native 2x Boost:
-        // Shift left by 2 to discard 1-clock delay bit, restore sign bit, and apply native 2x volume boost to standard HDMI line levels.
-        int32_t raw_l = (int16_t)((val >> 16) << 2);
-        int32_t raw_r = (int16_t)((val & 0xFFFF) << 2);
+        int32_t raw_l = (int16_t)(captured_l << audio_profile.alignment_shift);
+        int32_t raw_r = (int16_t)(captured_r << audio_profile.alignment_shift);
 
         // --- High-Precision Q16 DC Blocker (64-bit Overflow-Free) ---
         int64_t x_diff_l = (int64_t)raw_l - dc_prev_in_l;
@@ -425,15 +468,16 @@ void audio_task() {
         dc_y_accum_r = (x_diff_r * 65536LL) + feedback_r;
         int32_t filtered_r = (int32_t)(dc_y_accum_r >> 16);
 
-        s.left  = (int16_t)filtered_l;
-        s.right = (int16_t)filtered_r;
+        s.left  = clamp_i16(filtered_l);
+        s.right = clamp_i16(filtered_r);
 
         // --- Overflow-Safe Linear Interpolation SRC (Upsampling to 48000 Hz) ---
-        uint32_t phase_inc = ((uint64_t)current_i2s_rate << 16) / 48000;
-
         while (phase_accum < 0x10000) {
             if (hstx_di_queue_get_level() >= 150) {
                 // Buffer full: drop sample safely to prevent Core 1 lockout
+#if ENABLE_DIAGNOSTICS
+                diag_audio_queue_throttles++;
+#endif
                 phase_accum += phase_inc;
                 continue; 
             }
@@ -465,16 +509,12 @@ void audio_task() {
             }
 
 #if defined(AUDIO_VOLUME_PERCENT) && (AUDIO_VOLUME_PERCENT != 100)
-            out_l = (out_l * AUDIO_VOLUME_PERCENT) / 100;
-            out_r = (out_r * AUDIO_VOLUME_PERCENT) / 100;
-            if (out_l > 32767) out_l = 32767;
-            else if (out_l < -32768) out_l = -32768;
-            if (out_r > 32767) out_r = 32767;
-            else if (out_r < -32768) out_r = -32768;
+            out_l = (int32_t)(((int64_t)out_l * AUDIO_VOLUME_PERCENT) / 100);
+            out_r = (int32_t)(((int64_t)out_r * AUDIO_VOLUME_PERCENT) / 100);
 #endif
 
-            packet_samples[packet_idx].left  = (int16_t)out_l;
-            packet_samples[packet_idx].right = (int16_t)out_r;
+            packet_samples[packet_idx].left  = clamp_i16(out_l);
+            packet_samples[packet_idx].right = clamp_i16(out_r);
             packet_idx++;
             
             if (packet_idx == 4) {
@@ -495,11 +535,14 @@ void audio_task() {
     }
 }
 
+#define CORE1_READY_MAGIC 0x48444d49u
+
 void core1_main() {
     video_output_init(640, 480);
     video_output_set_scanline_callback(scanline_callback);
     pico_hdmi_set_audio_sample_rate(48000);
     video_output_set_background_task(audio_task);
+    multicore_fifo_push_blocking(CORE1_READY_MAGIC);
     video_output_core1_run();
 }
 
@@ -511,10 +554,7 @@ int main() {
     set_sys_clock_khz(252000, true);
     clock_configure_int_divider(clk_hstx, 0, CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLK_SYS, 252000000, 2);
     
-    stdio_init_all(); init_tables();
-#if ENABLE_DIAGNOSTICS
-    diag_last_time = time_us_64();
-#endif
+    stdio_init_all(); init_correction_tables();
     
     // Give DMA maximum priority
     bus_ctrl_hw->priority = BUSCTRL_BUS_PRIORITY_DMA_W_BITS | BUSCTRL_BUS_PRIORITY_DMA_R_BITS;
@@ -545,7 +585,9 @@ int main() {
     pio_sm_set_enabled(pio_aud, sm_aud, true);
     
     multicore_launch_core1(core1_main);
-    sleep_ms(100);
+    if (multicore_fifo_pop_blocking() != CORE1_READY_MAGIC) {
+        panic("Unexpected core 1 startup response");
+    }
 
     // Video PIO
     PIO pio_vid = pio0;
@@ -573,25 +615,67 @@ int main() {
     pio_sm_set_enabled(pio_vid, sm_vid, true);
 
     uint32_t last_idx = 0;
-    uint64_t last_active_time = time_us_64();
-    uint64_t last_data_time = time_us_64();
+    uint64_t now_us = time_us_64();
+    uint64_t last_active_time = now_us;
+    uint64_t last_data_time = now_us;
     bool has_signal = true;
 
+#if ENABLE_DIAGNOSTICS
+    const uint64_t diag_event_period_us = 250000ULL;
+    const uint64_t diag_health_period_us = 10000000ULL;
+    const uint64_t diag_window_stable_us = 500000ULL;
+    const uint64_t diag_audio_warning_stable_us = 1000000ULL;
+    uint64_t diag_last_event_time = now_us;
+    uint64_t diag_health_start_time = now_us;
+    uint64_t diag_window_candidate_since = now_us;
+    uint64_t diag_bad_audio_rate_since = 0;
+    bool diag_boot_reported = false;
+    bool diag_seen_video_data = false;
+    bool diag_video_active = false;
+    bool diag_audio_active = false;
+    bool diag_last_aspect = is_4_3;
+    bool diag_warned_video_rx_stall = false;
+    bool diag_warned_audio_rx_stall = false;
+    bool diag_warned_invalid_window = false;
+    bool diag_warned_audio_throttle = false;
+    bool diag_warned_audio_rate = false;
+    bool diag_warned_spi_clock = false;
+    uint16_t diag_window_candidate_x0 = UINT16_MAX;
+    uint16_t diag_window_candidate_y0 = UINT16_MAX;
+    uint16_t diag_window_candidate_x1 = UINT16_MAX;
+    uint16_t diag_window_candidate_y1 = UINT16_MAX;
+    uint16_t diag_reported_x0 = UINT16_MAX;
+    uint16_t diag_reported_y0 = UINT16_MAX;
+    uint16_t diag_reported_x1 = UINT16_MAX;
+    uint16_t diag_reported_y1 = UINT16_MAX;
+    uint32_t diag_last_audio_frames = 0;
+    uint32_t diag_last_reported_rate = 0;
+    uint32_t diag_last_health_throttles = 0;
+    uint32_t diag_video_rx_stalls = 0;
+    uint32_t diag_audio_rx_stalls = 0;
+    audio_filter_t diag_last_filter = AUDIO_FILTER_BYPASS;
+    uint32_t diag_last_alignment_shift = 0;
+    const char *diag_last_profile_name = NULL;
+#endif
+
     while (1) {
+        now_us = time_us_64();
         uint32_t curr_idx = (dma_hw->ch[dma_chan].write_addr - (uint32_t)spi_raw_buf) / 4;
         if (last_idx != curr_idx) {
 #if ENABLE_DIAGNOSTICS
             uint32_t count = (curr_idx - last_idx + SPI_BUF_SIZE) % SPI_BUF_SIZE;
+            if (count > diag_max_dma_backlog) diag_max_dma_backlog = count;
+            diag_seen_video_data = true;
             if (!in_burst) {
-                burst_start_time = time_us_64();
+                burst_start_time = now_us;
                 in_burst = true;
                 burst_bytes = 0;
             }
             burst_bytes += count;
-            burst_last_data_time = time_us_64();
+            burst_last_data_time = now_us;
 #endif
-            last_active_time = time_us_64();
-            last_data_time = time_us_64();
+            last_active_time = now_us;
+            last_data_time = now_us;
             if (!has_signal) {
                 has_signal = true;
                 memset(framebuffer, 0, sizeof(framebuffer));
@@ -601,21 +685,21 @@ int main() {
                 process_spi_byte(val & 0xFF, !((val >> 8) & 1));
                 last_idx = (last_idx + 1) % SPI_BUF_SIZE;
             }
-        } else if (gpio_get(3) && (time_us_64() - last_active_time > 100000ULL)) {
+        } else if (gpio_get(3) && (now_us - last_active_time > 100000ULL)) {
             pio_sm_restart(pio_vid, sm_vid); pio_sm_exec(pio_vid, sm_vid, pio_encode_jmp(offset_vid));
             last_idx = (dma_hw->ch[dma_chan].write_addr - (uint32_t)spi_raw_buf) / 4;
-            last_cmd = 0; pixel_byte_idx = 0; last_active_time = time_us_64();
+            last_cmd = 0; pixel_byte_idx = 0; last_active_time = now_us;
         }
 
         // Check for signal loss (10 seconds of no SPI data)
-        if (has_signal && (time_us_64() - last_data_time > 10000000ULL)) {
+        if (has_signal && (now_us - last_data_time > 10000000ULL)) {
             has_signal = false;
             memset(framebuffer, 0, sizeof(framebuffer));
             draw_string_2x("NO SIGNAL", 88, 112, 0xF800, 0x0000); // Red text on black background
         }
 
 #if ENABLE_DIAGNOSTICS
-        if (in_burst && (time_us_64() - burst_last_data_time > 1000ULL)) {
+        if (in_burst && (now_us - burst_last_data_time > 1000ULL)) {
             uint64_t dt = burst_last_data_time - burst_start_time;
             if (dt > 50) {
                 diag_active_transfer_time += dt;
@@ -625,65 +709,230 @@ int main() {
             in_burst = false;
         }
 
-        if (time_us_64() - diag_last_time > 1000000ULL) {
-            diag_last_time = time_us_64();
-            
-            float throughput_mb = (float)diag_bytes_received / (1024.0f * 1024.0f);
-            float fps = (float)diag_frame_count;
-            
-            float clk_mhz = 0.0f;
-            if (diag_active_transfer_time > 0) {
-                clk_mhz = ((float)diag_active_bytes * 9.0f) / (float)diag_active_transfer_time;
-            }
-            
+        // USB output is permitted only in a genuine input gap. If a source has
+        // continuous SPI traffic, defer diagnostics rather than risk the DMA
+        // ring wrapping while core 0 is formatting or transmitting text.
+        bool diag_spi_idle = now_us - last_active_time >= 2000ULL;
+
+        if (diag_spi_idle && now_us - diag_last_event_time >= diag_event_period_us) {
+            diag_last_event_time = now_us;
+
             uint32_t active_w = (end_x >= start_x) ? (end_x - start_x + 1) : 0;
             uint32_t active_h = (end_y >= start_y) ? (end_y - start_y + 1) : 0;
-            
-            char lpf_str[48];
-            if (current_i2s_rate < 24000) {
-                sprintf(lpf_str, "ACTIVE (Cutoff ~1200Hz)");
-            } else if (current_i2s_rate < 36000) {
-                if (active_h == 102 || active_h == 204 || (active_w * 10 >= active_h * 13)) {
-                    sprintf(lpf_str, "BYPASS (Atari Lynx)");
+            bool video_active_now = diag_seen_video_data && has_signal;
+            uint32_t audio_frames_now = diag_audio_frames;
+            bool audio_active_now = audio_frames_now != diag_last_audio_frames;
+            diag_last_audio_frames = audio_frames_now;
+
+            if (!diag_boot_reported) {
+                printf("BOOT diagnostics=event-driven heartbeat=10s\n");
+                if (!video_active_now) printf("VIDEO waiting-for-signal\n");
+                diag_boot_reported = true;
+            }
+
+            if (video_active_now != diag_video_active) {
+                if (video_active_now) {
+                    printf("VIDEO acquired\n");
+                    diag_window_candidate_x0 = start_x;
+                    diag_window_candidate_y0 = start_y;
+                    diag_window_candidate_x1 = end_x;
+                    diag_window_candidate_y1 = end_y;
+                    diag_window_candidate_since = now_us;
+                    diag_reported_x0 = UINT16_MAX;
+                    diag_reported_y0 = UINT16_MAX;
+                    diag_reported_x1 = UINT16_MAX;
+                    diag_reported_y1 = UINT16_MAX;
                 } else {
-                    sprintf(lpf_str, "ACTIVE (Cutoff ~2000Hz)");
+                    printf("VIDEO lost\n");
+                }
+                diag_video_active = video_active_now;
+            }
+
+            if (video_active_now) {
+                bool candidate_changed =
+                    start_x != diag_window_candidate_x0 ||
+                    start_y != diag_window_candidate_y0 ||
+                    end_x != diag_window_candidate_x1 ||
+                    end_y != diag_window_candidate_y1;
+                if (candidate_changed) {
+                    diag_window_candidate_x0 = start_x;
+                    diag_window_candidate_y0 = start_y;
+                    diag_window_candidate_x1 = end_x;
+                    diag_window_candidate_y1 = end_y;
+                    diag_window_candidate_since = now_us;
+                }
+
+                bool candidate_unreported =
+                    diag_window_candidate_x0 != diag_reported_x0 ||
+                    diag_window_candidate_y0 != diag_reported_y0 ||
+                    diag_window_candidate_x1 != diag_reported_x1 ||
+                    diag_window_candidate_y1 != diag_reported_y1;
+                if (candidate_unreported &&
+                    now_us - diag_window_candidate_since >= diag_window_stable_us) {
+                    uint32_t stable_w = diag_window_candidate_x1 >= diag_window_candidate_x0
+                        ? diag_window_candidate_x1 - diag_window_candidate_x0 + 1u : 0u;
+                    uint32_t stable_h = diag_window_candidate_y1 >= diag_window_candidate_y0
+                        ? diag_window_candidate_y1 - diag_window_candidate_y0 + 1u : 0u;
+                    printf("VIDEO stable-window=%lu,%lu-%lu,%lu size=%lux%lu\n",
+                           (unsigned long)diag_window_candidate_x0,
+                           (unsigned long)diag_window_candidate_y0,
+                           (unsigned long)diag_window_candidate_x1,
+                           (unsigned long)diag_window_candidate_y1,
+                           (unsigned long)stable_w, (unsigned long)stable_h);
+                    diag_reported_x0 = diag_window_candidate_x0;
+                    diag_reported_y0 = diag_window_candidate_y0;
+                    diag_reported_x1 = diag_window_candidate_x1;
+                    diag_reported_y1 = diag_window_candidate_y1;
+                }
+            }
+
+            if (is_4_3 != diag_last_aspect) {
+                printf("VIDEO output-aspect=%s\n", is_4_3 ? "4:3" : "16:9");
+                diag_last_aspect = is_4_3;
+            }
+
+            // Base diagnostic profile reporting on the last stable window. This
+            // suppresses launcher/loading-window noise without changing the
+            // live profile used by the audio processing path.
+            uint32_t profile_w = active_w;
+            uint32_t profile_h = active_h;
+            if (diag_reported_x0 != UINT16_MAX) {
+                profile_w = diag_reported_x1 >= diag_reported_x0
+                    ? diag_reported_x1 - diag_reported_x0 + 1u : 0u;
+                profile_h = diag_reported_y1 >= diag_reported_y0
+                    ? diag_reported_y1 - diag_reported_y0 + 1u : 0u;
+            }
+            audio_profile_t diag_audio_profile =
+                audio_profile_select(current_i2s_rate, profile_w, profile_h);
+
+            uint32_t rate_delta = current_i2s_rate > diag_last_reported_rate
+                ? current_i2s_rate - diag_last_reported_rate
+                : diag_last_reported_rate - current_i2s_rate;
+            uint32_t rate_threshold = diag_last_reported_rate / 20u;
+            if (rate_threshold < 250u) rate_threshold = 250u;
+            bool profile_changed = diag_last_profile_name == NULL ||
+                strcmp(diag_last_profile_name, diag_audio_profile.name) != 0 ||
+                diag_last_filter != diag_audio_profile.filter ||
+                diag_last_alignment_shift != diag_audio_profile.alignment_shift;
+
+            if (audio_active_now && (!diag_audio_active || profile_changed ||
+                                     rate_delta >= rate_threshold)) {
+                uint32_t gain = 1u << (diag_audio_profile.alignment_shift - 1u);
+                printf("AUDIO active rate=%lu profile=%s gain=%lux lpf=%s\n",
+                       (unsigned long)current_i2s_rate, diag_audio_profile.name,
+                       (unsigned long)gain,
+                       audio_filter_description(diag_audio_profile.filter));
+                diag_last_reported_rate = current_i2s_rate;
+                diag_last_profile_name = diag_audio_profile.name;
+                diag_last_filter = diag_audio_profile.filter;
+                diag_last_alignment_shift = diag_audio_profile.alignment_shift;
+            } else if (!audio_active_now && diag_audio_active) {
+                printf("AUDIO idle last-rate=%lu\n", (unsigned long)current_i2s_rate);
+            }
+            diag_audio_active = audio_active_now;
+
+            uint32_t video_rx_stall_mask =
+                1u << (PIO_FDEBUG_RXSTALL_LSB + sm_vid);
+            if ((pio_vid->fdebug & video_rx_stall_mask) != 0) {
+                pio_vid->fdebug = video_rx_stall_mask;
+                diag_video_rx_stalls++;
+                if (!diag_warned_video_rx_stall) {
+                    printf("WARN video-pio-rx-stall\n");
+                    diag_warned_video_rx_stall = true;
+                }
+            }
+
+            uint32_t audio_rx_stall_mask =
+                1u << (PIO_FDEBUG_RXSTALL_LSB + sm_aud);
+            if ((pio_aud->fdebug & audio_rx_stall_mask) != 0) {
+                pio_aud->fdebug = audio_rx_stall_mask;
+                diag_audio_rx_stalls++;
+                if (!diag_warned_audio_rx_stall) {
+                    printf("WARN audio-pio-rx-stall\n");
+                    diag_warned_audio_rx_stall = true;
+                }
+            }
+
+            if (diag_invalid_windows != 0 && !diag_warned_invalid_window) {
+                printf("WARN video-window-outside-framebuffer count=%lu\n",
+                       (unsigned long)diag_invalid_windows);
+                diag_warned_invalid_window = true;
+            }
+            if (diag_audio_queue_throttles != 0 && !diag_warned_audio_throttle) {
+                printf("WARN audio-hdmi-queue-throttled count=%lu\n",
+                       (unsigned long)diag_audio_queue_throttles);
+                diag_warned_audio_throttle = true;
+            }
+            if (audio_active_now && diag_raw_audio_rate != 0 &&
+                (diag_raw_audio_rate < 8000u || diag_raw_audio_rate > 192000u)) {
+                if (diag_bad_audio_rate_since == 0) {
+                    diag_bad_audio_rate_since = now_us;
+                } else if (!diag_warned_audio_rate &&
+                           now_us - diag_bad_audio_rate_since >=
+                               diag_audio_warning_stable_us) {
+                    printf("WARN audio-rate-out-of-range raw=%luHz\n",
+                           (unsigned long)diag_raw_audio_rate);
+                    diag_warned_audio_rate = true;
                 }
             } else {
-                sprintf(lpf_str, "BYPASS");
+                diag_bad_audio_rate_since = 0;
+                diag_warned_audio_rate = false;
             }
-            
-            printf("\n----------------------------------------\n");
-            printf("[SPI-to-HDMI Diagnostics Log]\n");
-            if (!has_signal) {
-                printf("Signal Status      : NO SIGNAL\n");
-                printf("Warning: No SPI video activity detected. Check wiring (CS, SCLK, MOSI).\n");
-            } else {
-                if (diag_bytes_received > 0 && fps == 0.0f) {
-                    printf("Signal Status      : UNSTABLE / INVALID\n");
-                } else {
-                    printf("Signal Status      : ACTIVE\n");
-                }
-                printf("SPI Clock (Est)    : %.1f MHz\n", clk_mhz);
-                printf("SPI Throughput     : %.2f MB/s\n", throughput_mb);
-                printf("Parsed Resolution  : %lux%lu\n", active_w, active_h);
-                printf("Video Frame Rate   : %.1f FPS\n", fps);
-                printf("Aspect Ratio Mode  : %s\n", is_4_3 ? "4:3 (Pillarbox)" : "16:9 (Stretch)");
-                printf("Audio Sample Rate  : %lu Hz\n", current_i2s_rate);
-                printf("Audio LPF Status   : %s\n", lpf_str);
-                
-                if (clk_mhz > 45.0f) {
-                    printf("Warning: SPI clock (%.1f MHz) exceeds 40MHz limit. May cause corruption.\n", clk_mhz);
-                }
-                if (diag_bytes_received > 0 && fps == 0.0f) {
-                    printf("Warning: SPI throughput detected but no valid frames received. Check signal/protocol.\n");
-                }
+        }
+
+        if (diag_spi_idle && now_us - diag_health_start_time >= diag_health_period_us) {
+            uint64_t elapsed_us = now_us - diag_health_start_time;
+            uint32_t spi_clock_tenths = 0;
+            if (diag_active_transfer_time != 0) {
+                spi_clock_tenths = (uint32_t)
+                    (((uint64_t)diag_active_bytes * 90ULL) / diag_active_transfer_time);
             }
-            printf("----------------------------------------\n");
-            
+
+            uint32_t payload_hundredths = (uint32_t)
+                (((uint64_t)diag_bytes_received * 100000000ULL) /
+                 (elapsed_us * 1048576ULL));
+            uint32_t write_rate_tenths = (uint32_t)
+                (((uint64_t)diag_frame_count * 10000000ULL) / elapsed_us);
+            uint32_t throttles_now = diag_audio_queue_throttles;
+            uint32_t throttle_delta = throttles_now - diag_last_health_throttles;
+            diag_last_health_throttles = throttles_now;
+
+            printf("HEALTH video=%s spi=%lu.%luMHz payload=%lu.%02luMiB/s "
+                   "writes=%lu.%lu/s windows=%lu backlog=%lu audio=%s rate=%luHz "
+                   "queue=%lu throttles=%lu vstall=%lu astall=%lu badwin=%lu\n",
+                   diag_video_active ? "active" : "idle",
+                   (unsigned long)(spi_clock_tenths / 10u),
+                   (unsigned long)(spi_clock_tenths % 10u),
+                   (unsigned long)(payload_hundredths / 100u),
+                   (unsigned long)(payload_hundredths % 100u),
+                   (unsigned long)(write_rate_tenths / 10u),
+                   (unsigned long)(write_rate_tenths % 10u),
+                   (unsigned long)diag_window_changes,
+                   (unsigned long)diag_max_dma_backlog,
+                   diag_audio_active ? "active" : "idle",
+                   (unsigned long)current_i2s_rate,
+                   (unsigned long)hstx_di_queue_get_level(),
+                   (unsigned long)throttle_delta,
+                   (unsigned long)diag_video_rx_stalls,
+                   (unsigned long)diag_audio_rx_stalls,
+                   (unsigned long)diag_invalid_windows);
+
+            if (spi_clock_tenths > 450u && !diag_warned_spi_clock) {
+                printf("WARN spi-clock-above-45MHz measured=%lu.%luMHz\n",
+                       (unsigned long)(spi_clock_tenths / 10u),
+                       (unsigned long)(spi_clock_tenths % 10u));
+                diag_warned_spi_clock = true;
+            } else if (spi_clock_tenths <= 450u) {
+                diag_warned_spi_clock = false;
+            }
+
             diag_bytes_received = 0;
             diag_frame_count = 0;
             diag_active_bytes = 0;
             diag_active_transfer_time = 0;
+            diag_max_dma_backlog = 0;
+            diag_window_changes = 0;
+            diag_health_start_time = now_us;
         }
 #endif
     }

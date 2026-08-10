@@ -181,7 +181,7 @@ static void dump_static_command_lists(void)
 // HSTX Resync - Reset output to sync with input VSYNC
 // ============================================================================
 
-static void __scratch_x("") hstx_resync(void)
+static void __attribute__((unused)) __scratch_x("") hstx_resync(void)
 {
     // 1. Abort DMA chains
     dma_channel_abort(DMACH_PING);
@@ -329,37 +329,37 @@ typedef struct {
     uint32_t active_line;
 } scanline_state_t;
 
-static inline void __scratch_x("") get_scanline_state(uint32_t v_scanline, scanline_state_t *state)
+static inline void __scratch_x("") get_scanline_state(uint32_t scanline, scanline_state_t *state)
 {
-    state->vsync_active = (v_scanline >= MODE_V_FRONT_PORCH && v_scanline < (MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH));
-    state->front_porch = (v_scanline < MODE_V_FRONT_PORCH);
-    state->back_porch = (v_scanline >= MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH &&
-                         v_scanline < MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH + MODE_V_BACK_PORCH);
+    state->vsync_active = (scanline >= MODE_V_FRONT_PORCH && scanline < (MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH));
+    state->front_porch = (scanline < MODE_V_FRONT_PORCH);
+    state->back_porch = (scanline >= MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH &&
+                         scanline < MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH + MODE_V_BACK_PORCH);
     state->active_video = (!state->vsync_active && !state->front_porch && !state->back_porch);
 
-    state->send_acr = (v_scanline >= (MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH) &&
-                       v_scanline < (MODE_V_TOTAL_LINES - MODE_V_ACTIVE_LINES) && (v_scanline % 4 == 0));
+    state->send_acr = (scanline >= (MODE_V_FRONT_PORCH + MODE_V_SYNC_WIDTH) &&
+                       scanline < (MODE_V_TOTAL_LINES - MODE_V_ACTIVE_LINES) && (scanline % 4 == 0));
 
     if (state->active_video) {
-        state->active_line = v_scanline - (MODE_V_TOTAL_LINES - MODE_V_ACTIVE_LINES);
+        state->active_line = scanline - (MODE_V_TOTAL_LINES - MODE_V_ACTIVE_LINES);
     } else {
         state->active_line = 0;
     }
 }
 
-static inline void __scratch_x("") video_output_handle_vsync(dma_channel_hw_t *ch, uint32_t v_scanline)
+static inline void __scratch_x("") video_output_handle_vsync(dma_channel_hw_t *ch, uint32_t scanline)
 {
     if (dvi_mode) {
         // Pure DVI: simple vsync line without Data Islands
         ch->read_addr = (uintptr_t)vblank_line_vsync_on;
         ch->transfer_count = count_of(vblank_line_vsync_on);
-        if (v_scanline == MODE_V_FRONT_PORCH) {
+        if (scanline == MODE_V_FRONT_PORCH) {
             video_frame_count++;
             if (vsync_callback)
                 vsync_callback();
         }
     } else {
-        if (v_scanline == MODE_V_FRONT_PORCH) {
+        if (scanline == MODE_V_FRONT_PORCH) {
             ch->read_addr = (uintptr_t)vblank_acr_vsync_on;
             ch->transfer_count = vblank_acr_vsync_on_len;
             video_frame_count++;
@@ -373,12 +373,13 @@ static inline void __scratch_x("") video_output_handle_vsync(dma_channel_hw_t *c
 }
 
 static inline void __scratch_x("")
-    video_output_handle_active_start(dma_channel_hw_t *ch, uint32_t v_scanline, uint32_t active_line, bool dma_pong)
+    video_output_handle_active_start(dma_channel_hw_t *ch, uint32_t scanline, uint32_t active_line,
+                                     bool use_pong_buffer)
 {
     uint32_t *dst32 = (uint32_t *)line_buffer;
 
     if (scanline_callback) {
-        scanline_callback(v_scanline, active_line, dst32);
+        scanline_callback(scanline, active_line, dst32);
     } else {
         // If no callback, just output black pixels
         for (uint32_t i = 0; i < MODE_H_ACTIVE_PIXELS / 2; i++) {
@@ -391,7 +392,7 @@ static inline void __scratch_x("")
         ch->read_addr = (uintptr_t)vactive_line_dvi;
         ch->transfer_count = count_of(vactive_line_dvi);
     } else {
-        uint32_t *buf = dma_pong ? vactive_di_ping : vactive_di_pong;
+        uint32_t *buf = use_pong_buffer ? vactive_di_ping : vactive_di_pong;
         const uint32_t *di_words = hstx_di_queue_get_audio_packet();
         if (di_words) {
             vactive_di_len = build_line_with_di(buf, di_words, false, true);
@@ -405,26 +406,27 @@ static inline void __scratch_x("")
 }
 
 static inline void __scratch_x("")
-    video_output_handle_blanking(dma_channel_hw_t *ch, uint32_t v_scanline, bool send_acr, bool dma_pong)
+    video_output_handle_blanking(dma_channel_hw_t *ch, uint32_t scanline, bool send_acr,
+                                 bool use_pong_buffer)
 {
     if (dvi_mode) {
         // Pure DVI: simple blanking line without Data Islands
         (void)send_acr;
-        (void)dma_pong;
-        (void)v_scanline;
+        (void)use_pong_buffer;
+        (void)scanline;
         ch->read_addr = (uintptr_t)vblank_line_vsync_off;
         ch->transfer_count = count_of(vblank_line_vsync_off);
     } else {
         if (send_acr) {
             ch->read_addr = (uintptr_t)vblank_acr_vsync_off;
             ch->transfer_count = vblank_acr_vsync_off_len;
-        } else if (v_scanline == 0) {
+        } else if (scanline == 0) {
             ch->read_addr = (uintptr_t)vblank_avi_infoframe;
             ch->transfer_count = vblank_avi_infoframe_len;
         } else {
             const uint32_t *di_words = hstx_di_queue_get_audio_packet();
             if (di_words) {
-                uint32_t *buf = dma_pong ? vblank_di_ping : vblank_di_pong;
+                uint32_t *buf = use_pong_buffer ? vblank_di_ping : vblank_di_pong;
                 vblank_di_len = build_line_with_di(buf, di_words, false, false);
                 ch->read_addr = (uintptr_t)buf;
                 ch->transfer_count = vblank_di_len;
