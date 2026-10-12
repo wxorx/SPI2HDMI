@@ -55,26 +55,29 @@ Core 1 runs the `audio_task` in the scanline blanking intervals. The RP2350 acts
 
 ## Hardware Wiring Guide
 
-The Pico 2 (RP2350) pins are configured as follows:
+This build targets the [Olimex RP2040-PICO-PC](https://www.olimex.com/Products/RaspberryPi/PICO/RP2040-PICO-PC/) carrier board with a Raspberry Pi Pico 2 (RP2350) module plugged into it. The board's onboard HDMI connector is used directly (it is hardwired to GPIO 12–19 with 270 Ω series termination), and the host's SPI/I2S signals are fed in through the board's UEXT connector.
 
-| Signal Name | Pico 2 GPIO | Wire Color / PCB Label | Description |
+| Signal Name | Pico 2 GPIO | Olimex Board Connection | Description |
 | :--- | :---: | :---: | :--- |
-| **SPI MOSI** | **0** | MOSI / SDA | ILI9341/ST7789 Serial Data Line |
-| **SPI D/C** | **1** | D/C / RS | Data / Command Selection |
-| **SPI CLK** | **2** | SCLK / SCK | SPI Serial Clock |
-| **SPI CS** | **3** | CS | Display Chip Select |
-| **I2S DATA** | **4** | I2S_DIN / DAT | Digital Audio Serial Data |
-| **I2S BCK** | **5** | I2S_BCK / CLK | Digital Audio Bit Clock |
-| **I2S WS** | **6** | I2S_LRC / WS | Digital Audio Word Select |
-| **HDMI TXC-** | **12** | TXC- | HDMI Clock Pair (Negative) |
-| **HDMI TXC+** | **13** | TXC+ | HDMI Clock Pair (Positive) |
-| **HDMI TX0-** | **14** | TX0- | Blue/Sync Channel (Negative) |
-| **HDMI TX0+** | **15** | TX0+ | Blue/Sync Channel (Positive) |
-| **HDMI TX1-** | **16** | TX1- | Green Channel (Negative) |
-| **HDMI TX1+** | **17** | TX1+ | Green Channel (Positive) |
-| **HDMI TX2-** | **18** | TX2- | Red Channel (Negative) |
-| **HDMI TX2+** | **19** | TX2+ | Red Channel (Positive) |
-| **ASPECT BTN**| **22** | BTN | Grounding button toggles 4:3/16:9 |
+| **SPI MOSI** | **4** | UEXT pin 7 | ILI9341/ST7789 Serial Data Line |
+| **SPI D/C** | **5** | UEXT pin 10 | Data / Command Selection |
+| **SPI CLK** | **6** | UEXT pin 9 | SPI Serial Clock |
+| **SPI CS** | **7** | UEXT pin 8 | Display Chip Select |
+| **I2S DATA** | **8** | UEXT pin 6 | Digital Audio Serial Data |
+| **I2S BCK** | **9** | UEXT pin 5 | Digital Audio Bit Clock |
+| **I2S WS** | **20** | UEXT pin 3 | Digital Audio Word Select |
+| **HDMI TXC- / TXC+** | **12 / 13** | Onboard HDMI connector | HDMI Clock Pair |
+| **HDMI TX0- / TX0+** | **14 / 15** | Onboard HDMI connector | Blue/Sync Channel |
+| **HDMI TX2- / TX2+** | **16 / 17** | Onboard HDMI connector | Red Channel |
+| **HDMI TX1- / TX1+** | **18 / 19** | Onboard HDMI connector | Green Channel |
+| **ASPECT BTN**| **3** | I2C (QWST) connector SCL pin | Grounding button toggles 4:3/16:9 |
+
+### Olimex Board Notes
+* **Use a Pico 2 (RP2350) module.** The firmware requires the RP2350's HSTX peripheral; an RP2040 Pico cannot run it.
+* **Red/green routing:** the Olimex board routes TMDS2 (red) to GPIO 16/17 and TMDS1 (green) to GPIO 18/19, the reverse of the reference breakout. The HSTX bit-crossbar mapping in `src/video_output.c` compensates for this, so the colors come out correct on the onboard HDMI connector. The pair polarity convention (even GPIO = minus, odd GPIO = plus) matches the board's wiring directly.
+* **Leave the microSD slot empty:** GPIO 4–7 are shared with the onboard microSD socket, which is used here for the host's SPI video signals.
+* **No external HDMI components are needed:** the board already provides the 270 Ω series termination and the connector.
+* **Flashing and USB diagnostics** go through the Pico module's own USB connector; the carrier board's micro-USB is power-only.
 
 ---
 

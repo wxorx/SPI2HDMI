@@ -21,6 +21,26 @@
 #include "spi_capture.pio.h"
 #include "i2s_audio.pio.h"
 
+// -----------------------------------------------------------------------------
+// Olimex RP2040-PICO-PC Pin Map
+//
+// This build targets the Olimex RP2040-PICO-PC carrier board with an RP2350
+// Pico 2 module plugged in. The board's onboard HDMI connector is hardwired
+// to GPIO 12-19 with 270-ohm series termination and the same TMDS polarity
+// convention as the reference breakout (even GPIO = minus, odd GPIO = plus),
+// but it routes red (TMDS2) to GPIO 16/17 and green (TMDS1) to GPIO 18/19;
+// the HSTX crossbar mapping in video_output.c is swapped accordingly.
+//
+// Host signals are fed in through the board's connectors:
+//   SPI video (UEXT):  MOSI = GP4 (UEXT pin 7), DC = GP5 (UEXT pin 10),
+//                      SCLK = GP6 (UEXT pin 9), CS = GP7 (UEXT pin 8)
+//   I2S audio (UEXT):  DAT  = GP8 (UEXT pin 6), BCK = GP9 (UEXT pin 5),
+//                      WS   = GP20 (UEXT pin 3)
+//   Aspect button:     GP3 (I2C/QWST connector SCL pin) to GND
+//
+// Leave the microSD slot empty: GP4-7 are shared with it.
+// -----------------------------------------------------------------------------
+
 // Brightness & Gamma Correction Configuration
 #define ENABLE_BRIGHTNESS_CORRECTION 1
 #define BRIGHTNESS_GAMMA             0.9f   // Exponent: < 1.0 brightens shadows, > 1.0 darkens
@@ -47,8 +67,8 @@ static uint16_t correction_b_lut[32];
 #define FB_HEIGHT 240
 #define FB_SIZE   (FB_WIDTH * FB_HEIGHT)
 
-// Aspect Ratio Toggle Button GPIO pin
-#define ASPECTBUTTON 22
+// Aspect Ratio Toggle Button GPIO pin (Olimex board: I2C/QWST connector SCL pin)
+#define ASPECTBUTTON 3
 #define ASPECT_DEBOUNCE_US 30000u
 
 // CMake's SPI_TO_HDMI_DIAGNOSTICS option controls both this code and USB stdio.
@@ -562,13 +582,13 @@ int main() {
     gpio_init(ASPECTBUTTON); gpio_set_dir(ASPECTBUTTON, GPIO_IN); gpio_pull_up(ASPECTBUTTON);
     
     // Noise Rejection
-    gpio_init(4); gpio_init(5); gpio_init(6);
-    gpio_disable_pulls(4); gpio_disable_pulls(5); gpio_disable_pulls(6);
-    gpio_set_input_hysteresis_enabled(4, true);
-    gpio_set_input_hysteresis_enabled(5, true);
-    gpio_set_input_hysteresis_enabled(6, true);
+    gpio_init(8); gpio_init(9); gpio_init(20);
+    gpio_disable_pulls(8); gpio_disable_pulls(9); gpio_disable_pulls(20);
+    gpio_set_input_hysteresis_enabled(8, true);
+    gpio_set_input_hysteresis_enabled(9, true);
+    gpio_set_input_hysteresis_enabled(20, true);
     
-    gpio_pull_up(3); 
+    gpio_pull_up(7); 
     for (int i = 0; i < FB_SIZE; i++) framebuffer[i] = 0x0000;
 
     // Audio PIO
@@ -576,9 +596,9 @@ int main() {
     uint offset_aud = pio_add_program(pio_aud, &i2s_capture_program);
     sm_aud = pio_claim_unused_sm(pio_aud, true);
     pio_sm_config c_aud = i2s_capture_program_get_default_config(offset_aud);
-    sm_config_set_in_pins(&c_aud, 4); 
-    pio_gpio_init(pio_aud, 4); pio_gpio_init(pio_aud, 5); pio_gpio_init(pio_aud, 6);
-    pio_sm_set_consecutive_pindirs(pio_aud, sm_aud, 4, 3, false);
+    sm_config_set_in_pins(&c_aud, 8); 
+    pio_gpio_init(pio_aud, 8); pio_gpio_init(pio_aud, 9); pio_gpio_init(pio_aud, 20);
+    pio_sm_set_pindirs_with_mask64(pio_aud, sm_aud, 0, (1ull << 8) | (1ull << 9) | (1ull << 20));
     sm_config_set_in_shift(&c_aud, false, false, 32); 
     sm_config_set_fifo_join(&c_aud, PIO_FIFO_JOIN_RX);
     pio_sm_init(pio_aud, sm_aud, offset_aud, &c_aud);
@@ -594,9 +614,9 @@ int main() {
     uint offset_vid = pio_add_program(pio_vid, &spi_st7789_program);
     uint sm_vid = pio_claim_unused_sm(pio_vid, true);
     pio_sm_config c_vid = spi_st7789_program_get_default_config(offset_vid);
-    sm_config_set_in_pins(&c_vid, 0); 
-    pio_gpio_init(pio_vid, 0); pio_gpio_init(pio_vid, 1); pio_gpio_init(pio_vid, 2); pio_gpio_init(pio_vid, 3);
-    pio_sm_set_consecutive_pindirs(pio_vid, sm_vid, 0, 3, false);
+    sm_config_set_in_pins(&c_vid, 4); 
+    pio_gpio_init(pio_vid, 4); pio_gpio_init(pio_vid, 5); pio_gpio_init(pio_vid, 6); pio_gpio_init(pio_vid, 7);
+    pio_sm_set_consecutive_pindirs(pio_vid, sm_vid, 4, 4, false);
     sm_config_set_in_shift(&c_vid, false, true, 9); 
     sm_config_set_fifo_join(&c_vid, PIO_FIFO_JOIN_RX);
     pio_sm_init(pio_vid, sm_vid, offset_vid, &c_vid);
@@ -611,7 +631,7 @@ int main() {
     channel_config_set_dreq(&dc, pio_get_dreq(pio_vid, sm_vid, false));
     dma_channel_configure(dma_chan, &dc, spi_raw_buf, &pio_vid->rxf[sm_vid], 0xFFFFFFFF, true);
 
-    while (!gpio_get(3)) tight_loop_contents();
+    while (!gpio_get(7)) tight_loop_contents();
     pio_sm_set_enabled(pio_vid, sm_vid, true);
 
     uint32_t last_idx = 0;
@@ -685,7 +705,7 @@ int main() {
                 process_spi_byte(val & 0xFF, !((val >> 8) & 1));
                 last_idx = (last_idx + 1) % SPI_BUF_SIZE;
             }
-        } else if (gpio_get(3) && (now_us - last_active_time > 100000ULL)) {
+        } else if (gpio_get(7) && (now_us - last_active_time > 100000ULL)) {
             pio_sm_restart(pio_vid, sm_vid); pio_sm_exec(pio_vid, sm_vid, pio_encode_jmp(offset_vid));
             last_idx = (dma_hw->ch[dma_chan].write_addr - (uint32_t)spi_raw_buf) / 4;
             last_cmd = 0; pixel_byte_idx = 0; last_active_time = now_us;

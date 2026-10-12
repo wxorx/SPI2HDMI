@@ -2,13 +2,13 @@
 
 ; Standard I2S (MSB) 16-bit Capture (1-clock delay)
 ; Retro-Go ESP32 output format (I2S_COMM_FORMAT_STAND_I2S)
-; Pin 0: DATA (GPIO 4)
-; Pin 1: BCK  (GPIO 5)
-; Pin 2: WS   (GPIO 6)
+; IN base = DATA (GPIO 8); BCK is polled as base+1 (GPIO 9), so DATA and BCK
+; must stay consecutive. WS is polled with absolute `wait gpio` operands
+; (GPIO 20), so it does not need to be consecutive with DATA/BCK.
 
     ; Sync to WS falling edge (Left channel boundary)
-    wait 1 pin 2
-    wait 0 pin 2
+    wait 1 gpio 20
+    wait 0 gpio 20
 
 .wrap_target
     ; === LEFT CHANNEL (WS LOW) ===
@@ -20,8 +20,8 @@ left_loop:
     jmp x-- left_loop
     
     ; === RIGHT CHANNEL (WS HIGH) ===
-    wait 0 pin 2
-    wait 1 pin 2
+    wait 0 gpio 20
+    wait 1 gpio 20
     
     set x, 15
 right_loop:
@@ -35,20 +35,21 @@ right_loop:
     push noblock
     
     ; Wait for WS falling edge to align with next frame start
-    wait 1 pin 2
-    wait 0 pin 2
+    wait 1 gpio 20
+    wait 0 gpio 20
 .wrap
 
 % c-sdk {
 #include "hardware/gpio.h"
 
 static inline void i2s_capture_program_init(PIO pio, uint sm, uint offset, uint pin_dat, uint pin_ws, uint pin_bck) {
+    // Constraints from the program text: pin_bck must equal pin_dat + 1
+    // (BCK is polled relative to the IN base), and pin_ws must be GPIO 20
+    // (WS is polled with absolute wait gpio operands).
     pio_sm_config c = i2s_capture_program_get_default_config(offset);
 
     // IN pin base = DAT
     sm_config_set_in_pins(&c, pin_dat);
-    // OUT pin set = DAT, BCK, WS (must be consecutive! 4, 5, 6)
-    sm_config_set_out_pins(&c, pin_dat, 3);
 
     // Shift LEFT (MSB first), no autopush.
     // Left channel shifts in first, pushed to bits 31:16.

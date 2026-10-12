@@ -632,8 +632,12 @@ void video_output_core1_run(void)
 
     hstx_ctrl_hw->bit[0] = HSTX_CTRL_BIT0_CLK_BITS | HSTX_CTRL_BIT0_INV_BITS;
     hstx_ctrl_hw->bit[1] = HSTX_CTRL_BIT0_CLK_BITS;
+    // BIT register N configures GPIO 12+N. The Olimex RP2040-PICO-PC routes
+    // TMDS2 (red) to GPIO 16/17 and TMDS1 (green) to GPIO 18/19, the reverse
+    // of the reference breakout, so lanes 1 and 2 target swapped pin pairs.
+    static const int lane_bit_base[3] = {2, 6, 4};
     for (uint lane = 0; lane < 3; ++lane) {
-        int bit = 2 + (lane * 2);
+        int bit = lane_bit_base[lane];
         uint32_t lane_data_sel_bits = (lane * 10) << HSTX_CTRL_BIT0_SEL_P_LSB | ((lane * 10) + 1)
                                                                                     << HSTX_CTRL_BIT0_SEL_N_LSB;
         hstx_ctrl_hw->bit[bit] = lane_data_sel_bits | HSTX_CTRL_BIT0_INV_BITS;
