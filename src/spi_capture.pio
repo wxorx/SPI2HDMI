@@ -1,17 +1,21 @@
 .program spi_st7789
 
-; 9-Bit Protocol Lock
-; Pin 0: MOSI, Pin 1: DC, Pin 2: SCLK
+; 32-Bit Protocol Lock (Olimex MOD-LCD UEXT convention)
+; IN base = DC (GPIO 4), CS (GPIO 5), SCLK (GPIO 6), MOSI (GPIO 7)
+; SCLK is polled with absolute wait gpio operands.
+; Each rising SCLK edge captures [DC, CS, SCLK, MOSI]; 8 edges per byte,
+; autopush at 32 bits. The OSR shifts left, so edge i+1 lands in nibble
+; (7-i): bit 31-4i = MOSI bit (7-i), bit 28-4i = DC. CS/SCLK bits unused.
 
 .wrap_target
-    wait 1 pin 2        ; Wait for SCLK High (Bit 7 of byte)
-    in pins, 2          ; Sample [DC, MOSI_Bit7]. DC is bit 1, MOSI is bit 0
-    wait 0 pin 2        ; Wait for SCLK Low
+    wait 1 gpio 6       ; Wait for SCLK High (Bit 7 of byte)
+    in pins, 4          ; Sample [DC, CS, SCLK, MOSI_Bit7]
+    wait 0 gpio 6       ; Wait for SCLK Low
     
     set x, 6            ; 7 more bits to go
 bit_loop:
-    wait 1 pin 2        ; SCLK High (Bits 6-0)
-    in pins, 1          ; Sample MOSI (Pin 0)
-    wait 0 pin 2        ; SCLK Low
+    wait 1 gpio 6       ; SCLK High (Bits 6-0)
+    in pins, 4          ; Sample [DC, CS, SCLK, MOSI_BitN]
+    wait 0 gpio 6       ; Wait for SCLK Low
     jmp x-- bit_loop
 .wrap

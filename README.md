@@ -57,12 +57,14 @@ Core 1 runs the `audio_task` in the scanline blanking intervals. The RP2350 acts
 
 This build targets the [Olimex RP2040-PICO-PC](https://www.olimex.com/Products/RaspberryPi/PICO/RP2040-PICO-PC/) carrier board with a Raspberry Pi Pico 2 (RP2350) module plugged into it. The board's onboard HDMI connector is used directly (it is hardwired to GPIO 12–19 with 270 Ω series termination), and the host's SPI/I2S signals are fed in through the board's UEXT connector.
 
+The SPI video input follows the **Olimex MOD-LCD2.8RTP UEXT convention** (D/C = pin 7, MOSI = pin 8, SCK = pin 9, CS = pin 10), so a host wired for the MOD-LCD display module — e.g. an ESP32-S3-DevKit-LiPo running Retro-Go — plugs into the bridge unchanged. On the carrier board those UEXT pins are GP4, GP7, GP6 and GP5 respectively.
+
 | Signal Name | Pico 2 GPIO | Olimex Board Connection | Description |
 | :--- | :---: | :---: | :--- |
-| **SPI MOSI** | **4** | UEXT pin 7 | ILI9341/ST7789 Serial Data Line |
-| **SPI D/C** | **5** | UEXT pin 10 | Data / Command Selection |
+| **SPI D/C** | **4** | UEXT pin 7 | Data / Command Selection |
+| **SPI CS** | **5** | UEXT pin 10 | Display Chip Select |
 | **SPI CLK** | **6** | UEXT pin 9 | SPI Serial Clock |
-| **SPI CS** | **7** | UEXT pin 8 | Display Chip Select |
+| **SPI MOSI** | **7** | UEXT pin 8 | ILI9341/ST7789 Serial Data Line |
 | **I2S DATA** | **8** | UEXT pin 6 | Digital Audio Serial Data |
 | **I2S BCK** | **9** | UEXT pin 5 | Digital Audio Bit Clock |
 | **I2S WS** | **20** | UEXT pin 3 | Digital Audio Word Select |
@@ -111,8 +113,11 @@ The PIO decoder expects an emulation of the **ILI9341/ST7789** controller. The h
 * **Column Address Set (0x2A):** Followed by 4 bytes (Start Column MSB/LSB, End Column MSB/LSB).
 * **Row Address Set (0x2B):** Followed by 4 bytes (Start Row MSB/LSB, End Row MSB/LSB).
 * **RAM Write (0x2C):** Followed by a stream of 16-bit RGB565 pixels (2 bytes per pixel, MSB first).
+* **SPI Mode:** The capture PIO samples on the **rising** edge of SCLK with the clock idling **Low** — standard **SPI mode 0**, which is what hardware SPI (`beginTransaction(..., SPI_MODE0)`) and Retro-Go use. Watch out for software bit-banged display libraries: the 6-argument `Adafruit_ILI9341(CS, DC, MOSI, SCLK, ...)` constructor, for example, bit-bangs with the clock idling **High** (mode 3). The ILI9341 tolerates both modes, but mode 3 garbles the bridge's capture — use the hardware-SPI constructor form (`Adafruit_ILI9341(CS, DC)`).
 
 If your host project uses a different display driver, it may work out-of-the-box as long as it uses the same standard address commands (0x2A, 0x2B, 0x2C).
+
+Note that the bridge displays **live-captured** traffic: a host that draws once and then goes silent will be shown for 10 seconds before the bridge reverts to its "NO SIGNAL" indicator. Test hosts should keep the bus active — periodically re-sending the identical frame is flicker-free on both the bridge and a connected LCD.
 
 #### Expected I2S Audio Protocol:
 The audio capture module expects **Standard I2S** (MSB-first, 16-bit stereo, 32fs frame structure). 

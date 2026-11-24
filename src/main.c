@@ -31,9 +31,11 @@
 // but it routes red (TMDS2) to GPIO 16/17 and green (TMDS1) to GPIO 18/19;
 // the HSTX crossbar mapping in video_output.c is swapped accordingly.
 //
-// Host signals are fed in through the board's connectors:
-//   SPI video (UEXT):  MOSI = GP4 (UEXT pin 7), DC = GP5 (UEXT pin 10),
-//                      SCLK = GP6 (UEXT pin 9), CS = GP7 (UEXT pin 8)
+// Host signals are fed in through the board's connectors, following the
+// Olimex MOD-LCD2.8RTP UEXT convention (D/C=7, MOSI=8, SCK=9, CS=10) so a
+// host wired for the LCD module plugs straight into the bridge:
+//   SPI video (UEXT):  DC   = GP4 (UEXT pin 7), CS = GP5 (UEXT pin 10),
+//                      SCLK = GP6 (UEXT pin 9),  MOSI = GP7 (UEXT pin 8)
 //   I2S audio (UEXT):  DAT  = GP8 (UEXT pin 6), BCK = GP9 (UEXT pin 5),
 //                      WS   = GP20 (UEXT pin 3)
 //   Aspect button:     GP3 (I2C/QWST connector SCL pin) to GND
@@ -588,7 +590,7 @@ int main() {
     gpio_set_input_hysteresis_enabled(9, true);
     gpio_set_input_hysteresis_enabled(20, true);
     
-    gpio_pull_up(7); 
+    gpio_pull_up(5); 
     for (int i = 0; i < FB_SIZE; i++) framebuffer[i] = 0x0000;
 
     // Audio PIO
@@ -617,7 +619,7 @@ int main() {
     sm_config_set_in_pins(&c_vid, 4); 
     pio_gpio_init(pio_vid, 4); pio_gpio_init(pio_vid, 5); pio_gpio_init(pio_vid, 6); pio_gpio_init(pio_vid, 7);
     pio_sm_set_consecutive_pindirs(pio_vid, sm_vid, 4, 4, false);
-    sm_config_set_in_shift(&c_vid, false, true, 9); 
+    sm_config_set_in_shift(&c_vid, false, true, 32); 
     sm_config_set_fifo_join(&c_vid, PIO_FIFO_JOIN_RX);
     pio_sm_init(pio_vid, sm_vid, offset_vid, &c_vid);
 
@@ -631,7 +633,7 @@ int main() {
     channel_config_set_dreq(&dc, pio_get_dreq(pio_vid, sm_vid, false));
     dma_channel_configure(dma_chan, &dc, spi_raw_buf, &pio_vid->rxf[sm_vid], 0xFFFFFFFF, true);
 
-    while (!gpio_get(7)) tight_loop_contents();
+    while (!gpio_get(5)) tight_loop_contents();
     pio_sm_set_enabled(pio_vid, sm_vid, true);
 
     uint32_t last_idx = 0;
@@ -702,10 +704,17 @@ int main() {
             }
             while (last_idx != curr_idx) {
                 uint32_t val = spi_raw_buf[last_idx];
-                process_spi_byte(val & 0xFF, !((val >> 8) & 1));
+                // Nibble-per-clock-edge capture (see spi_capture.pio). The OSR
+                // shifts left, so the first edge ends up in the top nibble:
+                // bit 31-4i = MOSI bit (7-i), bit 28 = D/C flag.
+                uint8_t spi_data = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    spi_data = (spi_data << 1) | ((val >> (31 - 4 * bit)) & 1u);
+                }
+                process_spi_byte(spi_data, !((val >> 28) & 1u));
                 last_idx = (last_idx + 1) % SPI_BUF_SIZE;
             }
-        } else if (gpio_get(7) && (now_us - last_active_time > 100000ULL)) {
+        } else if (gpio_get(5) && (now_us - last_active_time > 100000ULL)) {
             pio_sm_restart(pio_vid, sm_vid); pio_sm_exec(pio_vid, sm_vid, pio_encode_jmp(offset_vid));
             last_idx = (dma_hw->ch[dma_chan].write_addr - (uint32_t)spi_raw_buf) / 4;
             last_cmd = 0; pixel_byte_idx = 0; last_active_time = now_us;
